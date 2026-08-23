@@ -1,0 +1,15 @@
+(executable
+ (name bench)
+ (libraries gadget)
+ (ocamlopt_flags (:standard -O3))
+ (flags (:standard -w +a-4-9-26-27-30-32-40-41-42-44-45-48-66-67-70 -warn-error -a)))
+
+(rule
+ (alias bench)
+ (deps
+  bench.exe
+  (glob_files *.gs))
+ (action
+  (with-stdout-to
+   bench.md
+   (run ./bench.exe . 5 5))))

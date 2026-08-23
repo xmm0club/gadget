@@ -1,0 +1,6 @@
+(executable
+ (name main)
+ (public_name gadget)
+ (libraries gadget)
+ (ocamlopt_flags (:standard -O3))
+ (flags (:standard -w +a-4-9-26-27-30-32-40-41-42-44-45-48-66-67-70 -warn-error -a)))
