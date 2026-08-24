@@ -54,15 +54,17 @@ and ('e, 's, 't) code =
   | ( :: ) : ('e, 's, 'u) instr * ('e, 'u, 't) code -> ('e, 's, 't) code
 
 (* fn carries the callee's body rather than an index into a side table, so a function
-   reference cannot be paired with a body of the wrong type; the body never mentions its
-   own fn, self reference goes through frame slot 1, so there is no cycle to tie *)
+   reference cannot be paired with a body of the wrong type; self reference goes through
+   frame slot 1, but two members of a `let rec .. and ..` group do mention each other, so
+   the body is a thunk purely to let the compiler tie that knot without weakening the
+   index *)
 and ('env, 'a, 'b) fn =
   { id : int
   ; fname : string
   ; arg : 'a Ty.t
   ; ret : 'b Ty.t
   ; cap : 'env Ty.t
-  ; body : ('a * (('a -> 'b) * ('env * unit)), unit, 'b * unit) code
+  ; body : ('a * (('a -> 'b) * ('env * unit)), unit, 'b * unit) code Lazy.t
   }
 
 let rec append : type e s u t. (e, s, u) code -> (e, u, t) code -> (e, s, t) code =

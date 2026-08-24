@@ -34,6 +34,13 @@ let rec equal_ty a b =
     equal_ty a1 b1 && equal_ty a2 b2
   | _ -> false
 
+(* equality is expanded into a comparison per leaf at compile time, so it is defined at
+   every type that has no function inside it *)
+let rec comparable = function
+  | Tarrow _ -> false
+  | Tpair (a, b) -> comparable a && comparable b
+  | _ -> true
+
 type binop =
   | Add
   | Sub
@@ -90,7 +97,24 @@ let show_unop = function
   | Fst -> "fst"
   | Snd -> "snd"
 
-type expr = { desc : desc; loc : loc }
+(* a let binds a pattern, and a tuple pattern is desugared into a chain of fst and snd
+   bindings by the typechecker, so nothing downstream has to know about patterns *)
+type pat =
+  | Pvar of string
+  | Ppair of pat * pat
+
+let rec show_pat = function
+  | Pvar x -> x
+  | Ppair (a, b) -> "(" ^ show_pat a ^ ", " ^ show_pat_tail b ^ ")"
+
+and show_pat_tail = function
+  | Ppair (a, b) -> show_pat a ^ ", " ^ show_pat_tail b
+  | p -> show_pat p
+
+type expr =
+  { desc : desc
+  ; loc : loc
+  }
 
 and desc =
   | Int of int
@@ -101,21 +125,21 @@ and desc =
   | Bin of binop * expr * expr
   | Un of unop * expr
   | If of expr * expr * expr
-  | Let of string * ty option * expr * expr
-  | Let_pair of string * string * expr * expr
-  | Let_rec of letrec
-  | Fun of string * ty * expr
+  | Let of pat * ty option * expr * expr
+  | Let_rec of letrec list * expr
+  | Fun of string * ty option * expr
   | App of expr * expr
   | Pair of expr * expr
   | Ann of expr * ty
 
+(* a whole `let rec .. and ..` group; a return annotation is desugared into an Ann around
+   the body so the group only ever carries the parameter *)
 and letrec =
   { name : string
   ; param : string
-  ; param_ty : ty
-  ; ret_ty : ty
+  ; param_ty : ty option
   ; body : expr
-  ; rest : expr
+  ; rloc : loc
   }
 
 let mk loc desc = { desc; loc }

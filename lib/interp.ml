@@ -32,26 +32,15 @@ let rec eval (env : env) (t : Tast.t) : v =
   | Tast.Bool b -> Vbool b
   | Tast.Float f -> Vfloat f
   | Tast.Unit -> Vunit
-  | Tast.Var x -> (
-    match List.assoc_opt x env with
+  | Tast.Var v -> (
+    match List.assoc_opt v.Tast.vname env with
     | Some v -> v
-    | None -> Value.error "unbound variable %s" x)
+    | None -> Value.error "unbound variable %s" v.Tast.vname)
   | Tast.Bin (op, a, b) -> eval_bin env op a b
   | Tast.Un (op, a) -> eval_un env op a
   | Tast.If (c, a, b) -> if as_bool (eval env c) then eval env a else eval env b
-  | Tast.Let (x, rhs, body) ->
-    let v = eval env rhs in
-    eval ((x, v) :: env) body
-  | Tast.Let_pair (a, b, rhs, body) -> (
-    match eval env rhs with
-    | Vpair (x, y) -> eval ((b, y) :: (a, x) :: env) body
-    | _ -> Value.error "expected a tuple")
-  | Tast.Let_rec r ->
-    let c = { param = r.param; body = r.body; cenv = [] } in
-    let v = Vclos c in
-    c.cenv <- (r.name, v) :: env;
-    eval ((r.name, v) :: env) r.rest
-  | Tast.Fun l -> Vclos { param = l.param; body = l.body; cenv = env }
+  | Tast.Let g -> eval (List.fold_left bind env g.Tast.binds) g.Tast.gbody
+  | Tast.Fun l -> Vclos { param = l.Tast.param; body = l.Tast.body; cenv = env }
   | Tast.App (f, a) -> (
     match eval env f with
     | Vclos c ->
@@ -62,6 +51,20 @@ let rec eval (env : env) (t : Tast.t) : v =
     let x = eval env a in
     let y = eval env b in
     Vpair (x, y)
+
+(* every member of a recursive group is closed over the environment that already contains
+   all of them, so mutual recursion needs nothing beyond tying that knot once *)
+and bind env = function
+  | Tast.Bval (x, rhs) -> (x, eval env rhs) :: env
+  | Tast.Brec fns ->
+    let cs =
+      List.map (fun f -> { param = f.Tast.fparam; body = f.Tast.fbody; cenv = [] }) fns
+    in
+    let env' =
+      List.fold_left2 (fun acc f c -> (f.Tast.fname, Vclos c) :: acc) env fns cs
+    in
+    List.iter (fun c -> c.cenv <- env') cs;
+    env'
 
 and eval_bin env op a b =
   match op with
@@ -84,15 +87,27 @@ and eval_bin env op a b =
     | Ast.Fsub -> Vfloat (as_float x -. as_float y)
     | Ast.Fmul -> Vfloat (as_float x *. as_float y)
     | Ast.Fdiv -> Vfloat (as_float x /. as_float y)
-    | Ast.Lt | Ast.Le | Ast.Gt | Ast.Ge | Ast.Eq | Ast.Ne -> Vbool (compare_op op x y)
+    | Ast.Eq -> Vbool (equal x y)
+    | Ast.Ne -> Vbool (not (equal x y))
+    | Ast.Lt | Ast.Le | Ast.Gt | Ast.Ge -> Vbool (order_op op x y)
     | Ast.And | Ast.Or -> assert false)
 
-and compare_op op x y =
+(* the compiler expands equality into one comparison per leaf, so the tree walker has to
+   agree with it structurally rather than comparing representations *)
+and equal x y =
+  match x, y with
+  | Vint a, Vint b -> a = b
+  | Vfloat a, Vfloat b -> a = b
+  | Vbool a, Vbool b -> a = b
+  | Vunit, Vunit -> true
+  | Vpair (a1, a2), Vpair (b1, b2) -> equal a1 b1 && equal a2 b2
+  | _ -> Value.error "equality at an unsupported type"
+
+and order_op op x y =
   let c =
     match x, y with
     | Vint a, Vint b -> compare a b
     | Vfloat a, Vfloat b -> compare a b
-    | Vbool a, Vbool b -> compare a b
     | _ -> Value.error "comparison at an unsupported type"
   in
   match op with
@@ -100,8 +115,6 @@ and compare_op op x y =
   | Ast.Le -> c <= 0
   | Ast.Gt -> c > 0
   | Ast.Ge -> c >= 0
-  | Ast.Eq -> c = 0
-  | Ast.Ne -> c <> 0
   | _ -> assert false
 
 and eval_un env op a =

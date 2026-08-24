@@ -7,6 +7,7 @@ type token =
   | FALSE
   | LET
   | REC
+  | AND
   | IN
   | IF
   | THEN
@@ -46,6 +47,7 @@ let show = function
   | FALSE -> "false"
   | LET -> "let"
   | REC -> "rec"
+  | AND -> "and"
   | IN -> "in"
   | IF -> "if"
   | THEN -> "then"
@@ -144,6 +146,7 @@ let is_ident_char c = is_lower c || is_upper c || is_digit c || c = '_' || c = '
 let keyword = function
   | "let" -> Some LET
   | "rec" -> Some REC
+  | "and" -> Some AND
   | "in" -> Some IN
   | "if" -> Some IF
   | "then" -> Some THEN

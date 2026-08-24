@@ -1,0 +1,4 @@
+(* expect: (true, false) *)
+let rec even (n : Int) : Bool = if n == 0 then true else odd (n - 1)
+and odd (n : Int) : Bool = if n == 0 then false else even (n - 1)
+(even 10, odd 10)

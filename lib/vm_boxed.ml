@@ -119,7 +119,7 @@ and step : type e s t. e -> s -> (e, s, t) B.instr -> t =
 and closure : type env a b. (env, a, b) B.fn -> env -> a -> b =
  fun fn ev ->
   let rec self x =
-    let r, () = exec (x, (self, (ev, ()))) () fn.B.body in
+    let r, () = exec (x, (self, (ev, ()))) () (Lazy.force fn.B.body) in
     r
   in
   self

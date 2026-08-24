@@ -164,7 +164,7 @@ let rec drain s =
     let start = here s in
     Hashtbl.replace s.foff fn.B.id start;
     s.fn_starts <- (start, fn.B.fname) :: s.fn_starts;
-    emit_code s fn.B.body;
+    emit_code s (Lazy.force fn.B.body);
     op s I.ret;
     s.ranges <- (start, here s) :: s.ranges;
     drain s
