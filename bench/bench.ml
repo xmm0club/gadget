@@ -1,6 +1,8 @@
 open Gadget
 
-let programs = [ "fib.gs"; "loop.gs"; "mixed.gs" ]
+(* loop.gs and args.gs do the same work, one with the loop state tupled into a single
+   argument and one with it as two arguments, so they sit next to each other *)
+let programs = [ "fib.gs"; "loop.gs"; "args.gs"; "mixed.gs" ]
 
 let () =
   let dir = if Array.length Sys.argv > 1 then Sys.argv.(1) else "." in
