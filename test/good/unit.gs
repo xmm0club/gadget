@@ -1,2 +1,3 @@
+(* expect: () *)
 let u = ()
 u
