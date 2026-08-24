@@ -42,8 +42,14 @@ jobs:
       - name: create the oxcaml switch
         if: steps.opam-cache.outputs.cache-hit != 'true'
         run: |
+          # git runs maintenance in the background on a fresh clone, and the lock
+          # file it drops races opam's 'cp -PRp' of the repository
+          git config --global maintenance.auto false
+          git config --global gc.auto 0
+          git config --global fetch.writeCommitGraph false
           opam init --bare --disable-sandboxing --no-setup -y
-          opam switch create ox --empty --repos "$OX_REPO"
+          opam repository add ox git+https://github.com/oxcaml/opam-repository.git --dont-select --all-switches || opam repository set-url ox git+https://github.com/oxcaml/opam-repository.git --all-switches
+          opam switch create ox --empty --repos ox,default
           opam install -y --switch=ox ocaml-variants.5.4.0+ox "$OX_COMPILER"
           opam install -y --switch=ox dune
 
