@@ -40,7 +40,7 @@ type st =
   ; consts : cbuf
   ; kinds : ibuf
   ; ctbl : (int * int64, int) Hashtbl.t
-  ; mutable patches : (int * int) list
+  ; mutable patches : (int * int * int) list
   ; foff : (int, int) Hashtbl.t
   ; mutable queue : B.entry list
   ; queued : (int, unit) Hashtbl.t
@@ -79,8 +79,13 @@ let op1 s o arg =
   pos
 
 let here s = s.code.n
-let patch s pos target =
-  s.code.a.(pos) <- I.encode (I.opcode s.code.a.(pos)) target
+
+(* an arity of 0 means the operand is a plain target; anything else is a direct call and
+   the target has to be packed back together with its argument count *)
+let patch s pos target n =
+  let op = I.opcode s.code.a.(pos) in
+  let arg = if n = 0 then target else I.pack_dir target n in
+  s.code.a.(pos) <- I.encode op arg
 
 let rec emit_code : type e a b. st -> (e, a, b) B.code -> unit =
  fun s code ->
@@ -143,28 +148,45 @@ and emit_instr : type e a b. st -> (e, a, b) B.instr -> unit =
     let p1 = op1 s I.jmpf 0 in
     emit_code s a;
     let p2 = op1 s I.jmp 0 in
-    patch s p1 (here s);
+    patch s p1 (here s) 0;
     emit_code s b;
-    patch s p2 (here s)
+    patch s p2 (here s) 0
   | B.Mk_clos fn ->
     let p = op1 s I.mk_clos 0 in
-    s.patches <- (p, fn.B.id) :: s.patches;
+    s.patches <- (p, fn.B.id, 0) :: s.patches;
     if not (Hashtbl.mem s.queued fn.B.id)
     then begin
       Hashtbl.replace s.queued fn.B.id ();
       s.queue <- B.E fn :: s.queue
     end
   | B.Call -> op s I.call
+  | B.Call_dir (B.Dfn d, sp) ->
+    let n = B.arity sp in
+    if n < 1 || n > I.max_arity
+    then failwith "direct call arity does not fit in one instruction word";
+    let p = op1 s I.calldir 0 in
+    s.patches <- (p, d.B.did, n) :: s.patches;
+    if not (Hashtbl.mem s.queued d.B.did)
+    then begin
+      Hashtbl.replace s.queued d.B.did ();
+      s.queue <- B.D (B.Dfn d) :: s.queue
+    end
 
 let rec drain s =
   match s.queue with
   | [] -> ()
-  | B.E fn :: rest ->
+  | entry :: rest ->
     s.queue <- rest;
     let start = here s in
-    Hashtbl.replace s.foff fn.B.id start;
-    s.fn_starts <- (start, fn.B.fname) :: s.fn_starts;
-    emit_code s (Lazy.force fn.B.body);
+    let id, nm, body =
+      match entry with
+      | B.E fn -> fn.B.id, fn.B.fname, (fun () -> emit_code s (Lazy.force fn.B.body))
+      | B.D (B.Dfn d) ->
+        d.B.did, d.B.dname, (fun () -> emit_code s (Lazy.force d.B.dbody))
+    in
+    Hashtbl.replace s.foff id start;
+    s.fn_starts <- (start, nm) :: s.fn_starts;
+    body ();
     op s I.ret;
     s.ranges <- (start, here s) :: s.ranges;
     drain s
@@ -193,8 +215,11 @@ let tailcalls s =
   List.iter
     (fun (lo, hi) ->
       for pc = lo to hi - 1 do
-        if I.opcode code.(pc) = I.call && leads_to_ret code n (pc + 1)
+        let o = I.opcode code.(pc) in
+        if o = I.call && leads_to_ret code n (pc + 1)
         then code.(pc) <- I.tailcall
+        else if o = I.calldir && leads_to_ret code n (pc + 1)
+        then code.(pc) <- I.encode I.tailcalldir (I.operand code.(pc))
       done)
     s.ranges
 
@@ -205,9 +230,9 @@ let program (prog : B.program) =
   op s I.halt;
   drain s;
   List.iter
-    (fun (pos, id) ->
+    (fun (pos, id, n) ->
       match Hashtbl.find_opt s.foff id with
-      | Some off -> patch s pos off
+      | Some off -> patch s pos off n
       | None -> failwith "unresolved function reference")
     s.patches;
   tailcalls s;

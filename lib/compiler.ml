@@ -20,9 +20,16 @@ type _ caps =
       ('e, 'env) B.idx * 'env Ty.t * (string * int) list * (string * 'env sib) list
       -> 'e caps
 
+(* a function the compiler will call directly. It is not a value, so all a call site
+   needs is the callee, the name of the frame slot holding the environment the whole
+   group shares, and how many arguments it takes. None of that mentions the caller's
+   frame, so the registry travels into nested scopes unchanged. *)
+type known = Kn : ('env, 'args, 'b) B.dfn * string * int -> known
+
 type 'e scope =
   { ctx : 'e ctx
   ; caps : 'e caps
+  ; known : (string * known) list
   }
 
 let shift_caps : type e x. e caps -> (x * e) caps = function
@@ -30,7 +37,8 @@ let shift_caps : type e x. e caps -> (x * e) caps = function
   | Caps (i, t, names, sibs) -> Caps (B.S i, t, names, sibs)
 
 let push : type e a. e scope -> string -> a Ty.t -> (a * e) scope =
- fun sc name t -> { ctx = Ccons (name, t, sc.ctx); caps = shift_caps sc.caps }
+ fun sc name t ->
+  { ctx = Ccons (name, t, sc.ctx); caps = shift_caps sc.caps; known = sc.known }
 
 type ('e, 's) compiled = C : 'a Ty.t * ('e, 's, 'a * 's) B.code -> ('e, 's) compiled
 
@@ -115,7 +123,21 @@ and fv_binds binds body =
       (SSet.union inner (fv_binds rest body))
       fns
 
-type builder = { mutable next : int; mutable fns : B.entry list }
+(* the free names a body actually has to capture. A direct callee is not a value, so
+   what the body needs is the frame slot holding that callee's environment. *)
+let capture_set known t =
+  SSet.fold
+    (fun x acc ->
+      match List.assoc_opt x known with
+      | Some (Kn (_, envname, _)) -> SSet.add envname acc
+      | None -> SSet.add x acc)
+    (fv t) SSet.empty
+
+type builder =
+  { mutable next : int
+  ; mutable fns : B.entry list
+  ; mutable envs : int
+  }
 
 type ('e, 's) envbuild =
   | EB : 'env Ty.t * ('e, 's, 'env * 's) B.code -> ('e, 's) envbuild
@@ -123,7 +145,96 @@ type ('e, 's) envbuild =
 (* one member of a recursive group: the fn record, plus the action that installs its body
    once every member's fn record exists *)
 type 'env member =
-  | Mem : ('env, 'a, 'b) B.fn * ((string * 'env sib) list -> unit) -> 'env member
+  | Mem :
+      ('env, 'a, 'b) B.fn * ((string * 'env sib) list * (string * known) list -> unit)
+      -> 'env member
+
+type 'env direct =
+  | Dir : ('env, 'args, 'b) B.dfn * ((string * known) list -> unit) -> 'env direct
+
+(* pushing the parameters onto the environment slot builds the callee's frame and the
+   spine that describes it at the same time *)
+type 'base framed =
+  | Fr : ('args, 'base, 'out) B.spine * 'out ctx -> 'base framed
+
+let rec build_frame : type base. (string * Ty.packed) list -> base ctx -> base framed =
+ fun ps ctx ->
+  match ps with
+  | [] -> Fr (B.Sret, ctx)
+  | (nm, Ty.P t) :: rest ->
+    let (Fr (sp, c)) = build_frame rest (Ccons (nm, t, ctx)) in
+    Fr (B.Sarg (t, sp), c)
+
+let rec app_head (t : Tast.t) : Tast.t * Tast.t list =
+  match t.Tast.desc with
+  | Tast.App (f, a) ->
+    let h, args = app_head f in
+    h, args @ [ a ]
+  | _ -> t, []
+
+let rec peel_lams (t : Tast.t) acc =
+  match t.Tast.desc with
+  | Tast.Fun l -> peel_lams l.Tast.body ((l.Tast.param, l.Tast.param_ty) :: acc)
+  | _ -> List.rev acc, t
+
+(* a function can only be called directly if it is never used as a value: every
+   occurrence has to be the head of an application with exactly the right number of
+   arguments, otherwise something would need a closure that is never built *)
+let rec saturated name k (t : Tast.t) : bool =
+  match t.Tast.desc with
+  | Tast.Int _ | Tast.Bool _ | Tast.Float _ | Tast.Unit -> true
+  | Tast.Var v -> not (String.equal v.Tast.vname name)
+  | Tast.App _ -> (
+    let h, args = app_head t in
+    let ok = List.for_all (saturated name k) args in
+    match h.Tast.desc with
+    | Tast.Var v when String.equal v.Tast.vname name -> ok && List.length args = k
+    | _ -> ok && saturated name k h)
+  | Tast.Bin (_, a, b) | Tast.Pair (a, b) -> saturated name k a && saturated name k b
+  | Tast.Un (_, a) -> saturated name k a
+  | Tast.If (c, a, b) ->
+    saturated name k c && saturated name k a && saturated name k b
+  | Tast.Fun l -> String.equal l.Tast.param name || saturated name k l.Tast.body
+  | Tast.Let g -> saturated_binds name k g.Tast.binds g.Tast.gbody
+
+and saturated_binds name k binds body =
+  match binds with
+  | [] -> saturated name k body
+  | Tast.Bval (x, rhs) :: rest ->
+    saturated name k rhs
+    && (String.equal x name || saturated_binds name k rest body)
+  | Tast.Brec fns :: rest ->
+    List.for_all
+      (fun f -> String.equal f.Tast.fparam name || saturated name k f.Tast.fbody)
+      fns
+    && (List.exists (fun f -> String.equal f.Tast.fname name) fns
+        || saturated_binds name k rest body)
+
+(* the plan for one group: each member with the parameters it can absorb and the body
+   left over once they have been peeled off *)
+let direct_plan members rest body =
+  let plan =
+    List.map
+      (fun (name, first, fbody) ->
+        let ps, inner = peel_lams fbody first in
+        name, ps, inner)
+      members
+  in
+  let arity_ok (_, ps, _) =
+    let k = List.length ps in
+    k >= 2 && k <= Image.max_arity
+  in
+  let used_saturated (name, ps, _) =
+    let k = List.length ps in
+    List.for_all
+      (fun (_, ps, inner) ->
+        List.exists (fun (p, _) -> String.equal p name) ps || saturated name k inner)
+      plan
+    && saturated_binds name k rest body
+  in
+  if List.for_all arity_ok plan && List.for_all used_saturated plan
+  then Some plan
+  else None
 
 let iarith_of_op = function
   | Ast.Add -> B.Add
@@ -197,6 +308,23 @@ let rec compile : type e s. builder -> e scope -> Tast.t -> (e, s) compiled =
   | Tast.Fun l ->
     compile_lambda bld sc ~self:"" ~param:l.Tast.param ~param_ty:l.Tast.param_ty
       ~ret_ty:l.Tast.body.Tast.ty ~body:l.Tast.body
+  | Tast.App _ -> (
+    let h, args = app_head t in
+    match h.Tast.desc with
+    | Tast.Var v -> (
+      match List.assoc_opt v.Tast.vname sc.known with
+      | Some (Kn (dfn, envname, k)) when List.length args = k ->
+        compile_direct bld sc dfn envname args
+      | _ -> compile_app bld sc t)
+    | _ -> compile_app bld sc t)
+  | Tast.Pair (a, b) ->
+    let (C (ta, ca)) = compile bld sc a in
+    let (C (tb, cb)) = compile bld sc b in
+    C (Ty.Pair (ta, tb), B.(ca @: cb @: [ Mk_pair ]))
+
+and compile_app : type e s. builder -> e scope -> Tast.t -> (e, s) compiled =
+ fun bld sc t ->
+  match t.Tast.desc with
   | Tast.App (f, a) -> (
     let (C (tf, cf)) = compile bld sc f in
     match tf with
@@ -205,30 +333,184 @@ let rec compile : type e s. builder -> e scope -> Tast.t -> (e, s) compiled =
       let ca = coerce ta ta' ca in
       C (tb, B.(cf @: ca @: [ Call ]))
     | _ -> internal "application of a non-function")
-  | Tast.Pair (a, b) ->
-    let (C (ta, ca)) = compile bld sc a in
-    let (C (tb, cb)) = compile bld sc b in
-    C (Ty.Pair (ta, tb), B.(ca @: cb @: [ Mk_pair ]))
+  | _ -> internal "not an application"
+
+(* the environment goes on the stack under the arguments, and the spine that types the
+   call is rebuilt from the callee's own at this call site's stack *)
+and compile_direct : type e s env args b.
+    builder -> e scope -> (env, args, b) B.dfn -> string -> Tast.t list
+    -> (e, s) compiled =
+ fun bld sc dfn envname args ->
+  match dfn with
+  | B.Dfn d -> (
+    match lookup_var sc envname with
+    | None -> internal "the environment of %s is not in scope" d.B.dname
+    | Some (C (et, ec)) ->
+      let ec = coerce d.B.dcap et ec in
+      let (B.Rb sp) = B.rebase d.B.dargs in
+      let ac = args_code bld sc sp args in
+      C (d.B.dret, B.(ec @: ac @: [ Call_dir (dfn, sp) ])))
+
+and args_code : type e s args out.
+    builder -> e scope -> (args, s, out) B.spine -> Tast.t list -> (e, s, out) B.code =
+ fun bld sc sp args ->
+  match sp, args with
+  | B.Sret, [] -> B.[]
+  | B.Sarg (ty, rest), a :: more ->
+    let (C (at, ac)) = compile bld sc a in
+    let ac = coerce ty at ac in
+    B.(ac @: args_code bld sc rest more)
+  | _ -> internal "wrong number of arguments in a direct call"
 
 and compile_binds : type e s.
     builder -> e scope -> Tast.bind list -> Tast.t -> (e, s) compiled =
  fun bld sc binds body ->
   match binds with
   | [] -> compile bld sc body
+  (* a multi parameter function whose every use is a saturated call never needs to exist
+     as a closure, so it is compiled once with all of its parameters in one frame *)
+  | Tast.Bval (x, ({ Tast.desc = Tast.Fun _; _ } as rhs)) :: rest
+    when direct_plan [ x, [], rhs ] rest body <> None ->
+    let plan =
+      match direct_plan [ x, [], rhs ] rest body with
+      | Some p -> p
+      | None -> internal "unreachable"
+    in
+    compile_direct_group bld sc plan rest body
   | Tast.Bval (x, rhs) :: rest ->
     let (C (tr, cr)) = compile bld sc rhs in
     let (C (tb, cb)) = compile_binds bld (push sc x tr) rest body in
     C (tb, B.(cr @: [ Bind cb ]))
-  (* a group of one has no sibling to reach, so it keeps the original shape and does not
-     pay for the shared environment slot *)
-  | Tast.Brec [ f ] :: rest ->
-    let (C (tf, cf)) =
-      compile_lambda bld sc ~self:f.Tast.fname ~param:f.Tast.fparam
-        ~param_ty:f.Tast.fparam_ty ~ret_ty:f.Tast.fret_ty ~body:f.Tast.fbody
+  | Tast.Brec fns :: rest -> (
+    let members =
+      List.map
+        (fun f ->
+          ( f.Tast.fname
+          , [ f.Tast.fparam, f.Tast.fparam_ty ]
+          , f.Tast.fbody ))
+        fns
     in
-    let (C (tr, cr)) = compile_binds bld (push sc f.Tast.fname tf) rest body in
-    C (tr, B.(cf @: [ Bind cr ]))
-  | Tast.Brec fns :: rest -> compile_group bld sc fns rest body
+    match direct_plan members rest body with
+    | Some plan -> compile_direct_group bld sc plan rest body
+    | None -> (
+      match fns with
+      (* a curried group of one has no sibling to reach, so it keeps the original shape
+         and does not pay for the shared environment slot *)
+      | [ f ] ->
+        let (C (tf, cf)) =
+          compile_lambda bld sc ~self:f.Tast.fname ~param:f.Tast.fparam
+            ~param_ty:f.Tast.fparam_ty ~ret_ty:f.Tast.fret_ty ~body:f.Tast.fbody
+        in
+        let (C (tr, cr)) = compile_binds bld (push sc f.Tast.fname tf) rest body in
+        C (tr, B.(cf @: [ Bind cr ]))
+      | _ -> compile_group bld sc fns rest body))
+
+(* every member shares one environment, bound into a frame slot the call sites reach by
+   name; because the members are not values there is nothing else to bind and a call
+   allocates nothing at all *)
+and compile_direct_group : type e s.
+    builder
+    -> e scope
+    -> (string * (string * Ast.ty) list * Tast.t) list
+    -> Tast.bind list
+    -> Tast.t
+    -> (e, s) compiled =
+ fun bld sc plan rest body ->
+  let names = List.map (fun (n, _, _) -> n) plan in
+  let free =
+    List.fold_left
+      (fun acc (_, ps, inner) ->
+        let f = capture_set sc.known inner in
+        let f = List.fold_left (fun f (p, _) -> SSet.remove p f) f ps in
+        SSet.union acc f)
+      SSet.empty plan
+  in
+  let free = List.fold_left (fun acc n -> SSet.remove n acc) free names in
+  let free = SSet.elements free in
+  let envname =
+    bld.envs <- bld.envs + 1;
+    Printf.sprintf "$env#%d" bld.envs
+  in
+  let (EB (envty, envcode)) = build_env bld sc free in
+  let positions = List.mapi (fun i x -> x, i) free in
+  let dirs =
+    List.map (fun (n, ps, inner) -> make_direct bld envty envname positions n ps inner)
+      plan
+  in
+  let known =
+    List.map2
+      (fun (n, ps, _) (Dir (dfn, _)) -> n, Kn (dfn, envname, List.length ps))
+      plan dirs
+    @ sc.known
+  in
+  List.iter (fun (Dir (_, install)) -> install known) dirs;
+  (* forcing here rather than at emit time keeps lambdas nested inside these bodies
+     registered with the builder during compilation *)
+  List.iter (fun (Dir (B.Dfn d, _)) -> ignore (Lazy.force d.B.dbody)) dirs;
+  let sc0 = push sc envname envty in
+  let sc0 = { sc0 with known } in
+  let (C (tb, cb)) = compile_binds bld sc0 rest body in
+  C (tb, B.(envcode @: [ Bind cb ]))
+
+and make_direct : type env.
+    builder
+    -> env Ty.t
+    -> string
+    -> (string * int) list
+    -> string
+    -> (string * Ast.ty) list
+    -> Tast.t
+    -> env direct =
+ fun bld envty envname positions name params inner ->
+  let ps = List.map (fun (n, t) -> n, Ty.reflect t) params in
+  let (Ty.P rty) = Ty.reflect inner.Tast.ty in
+  match build_frame ps (Ccons (envname, envty, Cnil)) with
+  | Fr (sp, ctx) -> make_direct_at bld envty envname positions name sp ctx rty inner
+
+and make_direct_at : type env args frame b.
+    builder
+    -> env Ty.t
+    -> string
+    -> (string * int) list
+    -> string
+    -> (args, env * unit, frame) B.spine
+    -> frame ctx
+    -> b Ty.t
+    -> Tast.t
+    -> env direct =
+ fun bld envty envname positions name sp ctx rty inner ->
+  let hole : (unit -> (frame, unit, b * unit) B.code) ref =
+    ref (fun () -> internal "a direct body was forced before it was compiled")
+  in
+  let did = bld.next in
+  bld.next <- did + 1;
+  let dfn =
+    B.Dfn
+      { B.did
+      ; B.dname = name
+      ; B.dargs = sp
+      ; B.dret = rty
+      ; B.dcap = envty
+      ; B.dbody = lazy (!hole ())
+      }
+  in
+  bld.fns <- B.D dfn :: bld.fns;
+  let envidx : (frame, env) B.idx =
+    match lookup_local ctx envname with
+    | Some (L (t, i)) -> (
+      match Ty.equal envty t with
+      | Some Ty.Refl -> i
+      | None -> internal "the environment slot of %s has the wrong type" name)
+    | None -> internal "the environment slot of %s is missing" name
+  in
+  let install known =
+    let inner_scope = { ctx; caps = Caps (envidx, envty, positions, []); known } in
+    hole :=
+      fun () ->
+        let (C (tb, cb)) = compile bld inner_scope inner in
+        coerce rty tb cb
+  in
+  Dir (dfn, install)
 
 and compile_bin : type e s.
     builder -> e scope -> Ast.binop -> Tast.t -> Tast.t -> (e, s) compiled =
@@ -339,7 +621,9 @@ and compile_lambda : type e s.
     -> body:Tast.t
     -> (e, s) compiled =
  fun bld sc ~self ~param ~param_ty ~ret_ty ~body ->
-  let free = SSet.remove self (SSet.remove param (fv body)) |> SSet.elements in
+  let free =
+    SSet.remove self (SSet.remove param (capture_set sc.known body)) |> SSet.elements
+  in
   let (Ty.P pty) = Ty.reflect param_ty in
   let (Ty.P rty) = Ty.reflect ret_ty in
   let (EB (envty, envcode)) = build_env bld sc free in
@@ -347,6 +631,7 @@ and compile_lambda : type e s.
   let inner =
     { ctx = Ccons (param, pty, Ccons (self, Ty.Arrow (pty, rty), Ccons ("", envty, Cnil)))
     ; caps = Caps (B.S (B.S B.Z), envty, positions, [])
+    ; known = sc.known
     }
   in
   let (C (tb, cb)) = compile bld inner body in
@@ -375,7 +660,8 @@ and compile_group : type e s.
   let names = List.map (fun f -> f.Tast.fname) fns in
   let free =
     List.fold_left
-      (fun acc f -> SSet.union acc (SSet.remove f.Tast.fparam (fv f.Tast.fbody)))
+      (fun acc f ->
+        SSet.union acc (SSet.remove f.Tast.fparam (capture_set sc.known f.Tast.fbody)))
       SSet.empty fns
   in
   let free = List.fold_left (fun acc n -> SSet.remove n acc) free names in
@@ -384,7 +670,7 @@ and compile_group : type e s.
   let positions = List.mapi (fun i x -> x, i) free in
   let mems = List.map (make_member bld envty positions) fns in
   let sibs = List.map2 (fun name (Mem (fn, _)) -> name, Sib fn) names mems in
-  List.iter (fun (Mem (_, install)) -> install sibs) mems;
+  List.iter (fun (Mem (_, install)) -> install (sibs, sc.known)) mems;
   (* force now rather than at emit time so that lambdas nested inside these bodies are
      registered with the builder during compilation; forcing one member only mentions the
      others' records, it never forces them *)
@@ -425,7 +711,7 @@ and make_member_at : type env a b.
     }
   in
   bld.fns <- B.E fn :: bld.fns;
-  let install sibs =
+  let install (sibs, known) =
     let inner =
       { ctx =
           Ccons
@@ -433,6 +719,7 @@ and make_member_at : type env a b.
             , pty
             , Ccons (f.Tast.fname, Ty.Arrow (pty, rty), Ccons ("", envty, Cnil)) )
       ; caps = Caps (B.S (B.S B.Z), envty, positions, sibs)
+      ; known
       }
     in
     hole :=
@@ -460,12 +747,17 @@ and bind_members : type e s env.
     C (tb, B.(Load envidx :: Mk_clos fn :: [ Bind cb ]))
 
 let program (t : Tast.t) : B.program =
-  let bld = { next = 0; fns = [] } in
-  let sc = { ctx = Cnil; caps = No_caps } in
+  let bld = { next = 0; fns = []; envs = 0 } in
+  let sc = { ctx = Cnil; caps = No_caps; known = [] } in
   let (C (ty, code)) = compile bld sc t in
   let fns =
     List.rev bld.fns
-    |> List.sort (fun (B.E a) (B.E b) -> compare a.B.id b.B.id)
+    |> List.sort (fun a b ->
+           let key = function
+             | B.E f -> f.B.id
+             | B.D (B.Dfn d) -> d.B.did
+           in
+           compare (key a) (key b))
     |> Array.of_list
   in
   B.Program { fns; result = ty; main = code }

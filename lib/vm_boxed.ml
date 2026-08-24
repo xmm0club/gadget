@@ -114,6 +114,15 @@ and step : type e s t. e -> s -> (e, s, t) B.instr -> t =
   | B.Call ->
     let arg, (f, s) = stk in
     f arg, s
+  | B.Call_dir (dfn, sp) -> (
+    match dfn with
+    | B.Dfn d ->
+      let vs, base = B.take sp stk in
+      let ev, s = base in
+      (* the callee's frame is its captured environment with the arguments pushed back
+         on top of it, which is the same list at a different base *)
+      let r, () = exec (B.give d.B.dargs vs (ev, ())) () (Lazy.force d.B.dbody) in
+      r, s)
 
 (* a gadgetscript closure is an ocaml closure of exactly the type the index says *)
 and closure : type env a b. (env, a, b) B.fn -> env -> a -> b =

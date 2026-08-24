@@ -40,7 +40,9 @@ let op_snd = 38
 let mk_clos = 39
 let call = 40
 let tailcall = 41
-let n_opcodes = 42
+let calldir = 42
+let tailcalldir = 43
+let n_opcodes = 44
 
 let op_bits = 6
 let op_mask = 63
@@ -51,6 +53,16 @@ let[@inline] operand w = w asr op_bits
 
 let has_operand op =
   op = lit || op = load || op = unbind || op = jmp || op = jmpf || op = mk_clos
+  || op = calldir || op = tailcalldir
+
+(* a direct call needs both a target and an argument count in one instruction word, so
+   the low 3 bits of the operand hold the arity biased by one *)
+let arity_bits = 3
+let max_arity = 8
+
+let[@inline] pack_dir target n = (target lsl arity_bits) lor (n - 1)
+let[@inline] dir_target arg = arg asr arity_bits
+let[@inline] dir_arity arg = (arg land (max_arity - 1)) + 1
 
 let name op =
   if op = halt then "halt"
@@ -95,6 +107,8 @@ let name op =
   else if op = mk_clos then "mk_clos"
   else if op = call then "call"
   else if op = tailcall then "tailcall"
+  else if op = calldir then "calldir"
+  else if op = tailcalldir then "tailcalldir"
   else "?"
 
 type t =
@@ -116,12 +130,17 @@ let disassemble img =
        | None -> ());
       let op = opcode w in
       let arg = operand w in
-      if has_operand op
+      if op = calldir || op = tailcalldir
       then
+        Buffer.add_string b
+          (Printf.sprintf "%4d  %-11s %d  ; %d args\n" pc (name op) (dir_target arg)
+             (dir_arity arg))
+      else if has_operand op
+      then (
         let extra =
           if op = lit then Printf.sprintf "   ; 0x%Lx" img.consts.(arg) else ""
         in
-        Buffer.add_string b (Printf.sprintf "%4d  %-8s %d%s\n" pc (name op) arg extra)
+        Buffer.add_string b (Printf.sprintf "%4d  %-11s %d%s\n" pc (name op) arg extra))
       else Buffer.add_string b (Printf.sprintf "%4d  %s\n" pc (name op)))
     img.code;
   Buffer.contents b

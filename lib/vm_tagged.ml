@@ -228,6 +228,31 @@ let link (m : t) (p : loaded) : unit -> v =
         set frame (fbase + 1) (get stack (sp - 2));
         loop target (sp - 2) (fbase + 3) fbase csp
       | _ -> bad "a closure")
+    (* a direct call: the environment sits under the arguments on the stack, and the
+       frame the callee sees is that environment with the arguments pushed on top, so
+       there is no closure to look through and no self slot *)
+    | 42 ->
+      let arg = w asr 6 in
+      let target = arg asr 3 in
+      let n = (arg land 7) + 1 in
+      if csp >= m.call_len || fsp + n + 1 >= m.frame_len || sp + margin >= m.stack_len
+      then Value.error "stack overflow";
+      set retpc csp (pc + 1);
+      set retfb csp fbase;
+      set frame fsp (get stack (sp - 1 - n));
+      for i = 0 to n - 1 do
+        set frame (fsp + 1 + i) (get stack (sp - n + i))
+      done;
+      loop target (sp - n - 1) (fsp + n + 1) fsp (csp + 1)
+    | 43 ->
+      let arg = w asr 6 in
+      let target = arg asr 3 in
+      let n = (arg land 7) + 1 in
+      set frame fbase (get stack (sp - 1 - n));
+      for i = 0 to n - 1 do
+        set frame (fbase + 1 + i) (get stack (sp - n + i))
+      done;
+      loop target (sp - n - 1) (fbase + n + 1) fbase csp
     | _ -> Value.error "illegal opcode"
   in
   fun () -> loop 0 0 0 0 0

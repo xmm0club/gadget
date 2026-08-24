@@ -56,6 +56,24 @@ and odd (n : Int) : Bool = if n == 0 then false else even (n - 1)
 even 2000
 ```
 
+A function of several parameters that is only ever used saturated is called directly: all
+of its arguments go into one frame, so the call builds no closure and allocates nothing.
+`loop` below is a tail recursive two argument loop that runs with an empty arena
+
+```
+let rec loop i acc = if i == 0 then acc else loop (i - 1) (acc + i)
+loop 1000000 0
+```
+
+Partial application still works; a function used that way is compiled the curried way
+instead, one closure per argument
+
+```
+let add a b = a + b
+let inc = add 1
+(inc 5, add 2 3)
+```
+
 Functions take several parameters as sugar for nested one parameter lambdas, a let binds a
 tuple pattern and patterns nest, and `==` and `!=` work at any type with no function inside
 it
@@ -92,6 +110,18 @@ Comparison operators do not chain, and `a < b < c` is a syntax error that says t
 - A member reaches a sibling by rebuilding that siblings closure out of the environment the
   whole group shares, so a mutually recursive group never needs a cyclic value in the arena
   and needs no new opcode, at the cost of two arena words per crossing
+- `Call_dir` is a saturated call to a statically known function. It is indexed by a spine
+  that is the list of argument types, and the same spine describes two things depending on
+  what its base is: over the caller's operand stack it is the shape the call consumes, and
+  over the callee's captured environment it is the frame the body sees. That is what ties a
+  call site to its callee, and it means arity is checked the same way the operand stack is
+- A directly called function is never a value, so it has no closure block and no self slot,
+  and it recurses by calling itself directly. Only functions whose every occurrence is a
+  saturated call are compiled that way; anything used as a value or applied to too few
+  arguments falls back to the curried form, which is how partial application keeps working
+- `calldir` carries its target and its argument count in one instruction word, three bits
+  of it for an arity of at most eight, so a direct call is still one word like everything
+  else
 - A recursive descent parser feeds a Hindley Milner typechecker with levels for
   generalisation, producing a typed AST which is monomorphised, closure converted into the
   GADT and then erased into a flat image of one 32 bit word per instruction
@@ -115,12 +145,16 @@ Comparison operators do not chain, and `a < b < c` is a syntax error that says t
 
 ## Not done
 
-- Calls are still one argument at a time, so a multi parameter function allocates one
-  closure per argument. A real n ary calling convention needs an arity carrying `Call` and
-  a different frame layout, which is a change to the unboxed eval loop rather than to the
-  front end
-- Strings, chars and lists need a sum type and a variable size heap, and the arena is a
-  bump allocator with no collector, so both are blocked on the same missing piece
+- The arena is still a bump allocator with no collector, so a program that allocates in a
+  loop runs out rather than collecting. Direct calls remove the closure per argument, which
+  is what made a plain two argument loop allocate, but a loop that builds tuples still
+  grows the arena until it is exhausted. Collecting needs stack maps, which the emitter has
+  the information to produce because it knows the static type at every call site
+- Strings, chars and lists are missing. Lists need no tag, since the static type already
+  says what a word is and nil can be the null pointer, but they do need the collector above
+  to be worth having
+- A partially applied function is compiled the curried way, so only saturated calls get the
+  flat frame. Closing that gap needs compiler generated wrappers rather than a fallback
 - Monomorphisation re elaborates a generalised binding once per instantiation, and a
   binding nested inside another one is elaborated once per pair, so deeply nested
   polymorphism costs compile time

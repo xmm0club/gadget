@@ -253,6 +253,32 @@ let link (m : t) (p : loaded) : unit -> int64# =
       uset frame fbase (uget arena (clos + 1));
       uset frame (fbase + 1) (uget stack (sp - 2));
       loop (I64.to_int (uget arena clos)) (sp - 2) (fbase + 3) fbase csp ap
+    (* a direct call: the environment sits under the arguments on the stack, and the
+       frame the callee sees is that environment with the arguments pushed on top, so
+       there is no closure to look through and no self slot; the low 3 bits of the
+       operand carry the argument count *)
+    | 42 ->
+      let arg = w asr 6 in
+      let target = arg asr 3 in
+      let n = (arg land 7) + 1 in
+      if csp >= call_len || fsp + n + 1 >= frame_len || sp + margin >= stack_len
+      then Value.error "stack overflow";
+      Array.unsafe_set retpc csp (pc + 1);
+      Array.unsafe_set retfb csp fbase;
+      uset frame fsp (uget stack (sp - 1 - n));
+      for i = 0 to n - 1 do
+        uset frame (fsp + 1 + i) (uget stack (sp - n + i))
+      done;
+      loop target (sp - n - 1) (fsp + n + 1) fsp (csp + 1) ap
+    | 43 ->
+      let arg = w asr 6 in
+      let target = arg asr 3 in
+      let n = (arg land 7) + 1 in
+      uset frame fbase (uget stack (sp - 1 - n));
+      for i = 0 to n - 1 do
+        uset frame (fbase + 1 + i) (uget stack (sp - n + i))
+      done;
+      loop target (sp - n - 1) (fbase + n + 1) fbase csp ap
     | _ ->
       (* Value.error is 'a : value and the loop returns bits64, so it cannot be the tail *)
       let () = Value.error "illegal opcode" in
@@ -296,6 +322,7 @@ let opcodes_agree () =
   && Image.feq = 29 && Image.fne = 30 && Image.beq = 31 && Image.bne = 32
   && Image.lnot = 33 && Image.of_int = 34 && Image.to_int = 35 && Image.mk_pair = 36
   && Image.op_fst = 37 && Image.op_snd = 38 && Image.mk_clos = 39 && Image.call = 40
-  && Image.tailcall = 41 && Image.n_opcodes = 42
+  && Image.tailcall = 41 && Image.calldir = 42 && Image.tailcalldir = 43
+  && Image.n_opcodes = 44
 
 let () = if not (opcodes_agree ()) then failwith "vm: opcode table out of sync"
