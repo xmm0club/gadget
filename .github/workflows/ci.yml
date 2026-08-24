@@ -10,10 +10,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # oxcaml-compiler is pinned. The opam file for a release carries a patch
+  # against a git tag that upstream is free to move, and the patch shipped for
+  # 5.4.0-ox2 no longer applies to the tarball its checksum now points at.
+  OX_COMPILER: oxcaml-compiler.5.4.0-ox1
+  OX_REPO: ox=git+https://github.com/oxcaml/opam-repository.git,default
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    # OxCaml is built from source the first time; after that the switch comes
+    # OxCaml is built from source the first time; afterwards the switch comes
     # back out of the cache and the job takes a couple of minutes
     timeout-minutes: 180
 
@@ -23,26 +30,21 @@ jobs:
       - name: install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y opam autoconf build-essential pkg-config \
-            binutils rsync
+          sudo apt-get install -y opam autoconf build-essential pkg-config binutils rsync
 
       - name: cache the opam root
         id: opam-cache
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-${{ runner.os }}-oxcaml-5.4.0+ox-v1
-
-      - name: init opam
-        if: steps.opam-cache.outputs.cache-hit != 'true'
-        run: opam init --bare --disable-sandboxing --no-setup -y
+          key: opam-${{ runner.os }}-${{ env.OX_COMPILER }}-v2
 
       - name: create the oxcaml switch
         if: steps.opam-cache.outputs.cache-hit != 'true'
         run: |
-          opam switch create ox 5.4.0+ox \
-            --repos ox=git+https://github.com/oxcaml/opam-repository.git,default \
-            -y
+          opam init --bare --disable-sandboxing --no-setup -y
+          opam switch create ox --empty --repos "$OX_REPO"
+          opam install -y --switch=ox ocaml-variants.5.4.0+ox "$OX_COMPILER"
           opam install -y --switch=ox dune
 
       - name: versions
@@ -63,7 +65,7 @@ jobs:
           eval $(opam env --switch=ox)
           dune test --force
 
-      # the point of the whole design: ill typed bytecode must be rejected by
+      # the point of the whole design: ill typed bytecode has to be rejected by
       # the host typechecker rather than at run time
       - name: ill typed bytecode is a compile error
         run: |
