@@ -74,9 +74,8 @@ let inc = add 1
 (inc 5, add 2 3)
 ```
 
-Functions take several parameters as sugar for nested one parameter lambdas, a let binds a
-tuple pattern and patterns nest, and `==` and `!=` work at any type with no function inside
-it
+A let binds a tuple pattern, patterns nest and work in parameter position too, and `==` and
+`!=` are defined at any type with no function inside it
 
 ```
 let dist (x1, y1) (x2, y2) = (x2 - x1, y2 - y1)
