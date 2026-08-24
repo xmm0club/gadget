@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # OxCaml is built from source the first time; after that the switch comes
+    # back out of the cache and the job takes a couple of minutes
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y opam autoconf build-essential pkg-config \
+            binutils rsync
+
+      - name: cache the opam root
+        id: opam-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-${{ runner.os }}-oxcaml-5.4.0+ox-v1
+
+      - name: init opam
+        if: steps.opam-cache.outputs.cache-hit != 'true'
+        run: opam init --bare --disable-sandboxing --no-setup -y
+
+      - name: create the oxcaml switch
+        if: steps.opam-cache.outputs.cache-hit != 'true'
+        run: |
+          opam switch create ox 5.4.0+ox \
+            --repos ox=git+https://github.com/oxcaml/opam-repository.git,default \
+            -y
+          opam install -y --switch=ox dune
+
+      - name: versions
+        run: |
+          eval $(opam env --switch=ox)
+          ocamlopt -version
+          dune --version
+
+      - name: build
+        run: |
+          eval $(opam env --switch=ox)
+          dune build
+
+      # every good program has to give the same answer under all four
+      # interpreters, and the unboxed eval loop has to allocate nothing
+      - name: test
+        run: |
+          eval $(opam env --switch=ox)
+          dune test --force
+
+      # the point of the whole design: ill typed bytecode must be rejected by
+      # the host typechecker rather than at run time
+      - name: ill typed bytecode is a compile error
+        run: |
+          eval $(opam env --switch=ox)
+          sh scripts/check_ill_typed.sh
+
+      # checks the representation claims against the emitted machine code
+      - name: eval loop has no allocation point
+        run: |
+          eval $(opam env --switch=ox)
+          sh scripts/verify_unboxed.sh
+
+      - name: bench
+        run: |
+          eval $(opam env --switch=ox)
+          dune build @bench
+          cat _build/default/bench/bench.md
+
+      - name: disassemble a mutually recursive program
+        run: |
+          eval $(opam env --switch=ox)
+          dune exec -- gadget disasm test/good/mutual.gs
