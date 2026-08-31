@@ -115,6 +115,9 @@ type t =
   { code : int array
   ; consts : int64 array
   ; const_kinds : int array
+  ; stack_maps : int array array
+  ; frame_maps : int array array
+  ; heap_layouts : int array
   ; result : Ast.ty
   ; fn_starts : (int * string) list
   }

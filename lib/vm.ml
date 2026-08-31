@@ -28,11 +28,18 @@ type t =
   ; arena : int64# array
   ; retpc : int array
   ; retfb : int array
+  ; retsp : int array
+  ; layouts : int array
+  ; marks : int array
+  ; work : int array
   ; stack_len : int
   ; frame_len : int
   ; arena_len : int
   ; call_len : int
   ; mutable ap : int
+  ; mutable mark_head : int
+  ; mutable mark_tail : int
+  ; mutable gc_new : int
   }
 
 let create ?(stack = 1 lsl 19) ?(frame = 1 lsl 19) ?(arena = 1 lsl 22) ?(calls = 1 lsl 19) ()
@@ -42,16 +49,26 @@ let create ?(stack = 1 lsl 19) ?(frame = 1 lsl 19) ?(arena = 1 lsl 22) ?(calls =
   ; arena = umake arena #0L
   ; retpc = Array.make calls 0
   ; retfb = Array.make calls 0
+  ; retsp = Array.make calls 0
+  ; layouts = Array.make ((arena + 1) / 2) 0
+  ; marks = Array.make ((arena + 1) / 2) 0
+  ; work = Array.make ((arena + 1) / 2) 0
   ; stack_len = stack
   ; frame_len = frame
   ; arena_len = arena
   ; call_len = calls
   ; ap = 0
+  ; mark_head = 0
+  ; mark_tail = 0
+  ; gc_new = 0
   }
 
 type loaded =
   { code : int32# array
   ; consts : int64# array
+  ; stack_maps : int array array
+  ; frame_maps : int array array
+  ; heap_layouts : int array
   ; result : Ast.ty
   }
 
@@ -62,7 +79,108 @@ let load (img : Image.t) =
   let m = Array.length img.Image.consts in
   let consts : int64# array = umake (max m 1) #0L in
   Array.iteri (fun i x -> uset consts i (I64.of_int64 x)) img.Image.consts;
-  { code; consts; result = img.Image.result }
+  { code
+  ; consts
+  ; stack_maps = img.Image.stack_maps
+  ; frame_maps = img.Image.frame_maps
+  ; heap_layouts = img.Image.heap_layouts
+  ; result = img.Image.result
+  }
+
+let mark m word =
+  let off = I64.to_int word in
+  let obj = off lsr 1 in
+  if Array.unsafe_get m.marks obj = 0
+  then begin
+    Array.unsafe_set m.marks obj 1;
+    Array.unsafe_set m.work m.mark_tail off;
+    m.mark_tail <- m.mark_tail + 1
+  end
+
+let mark_depths m slots top skip depths =
+  for i = 0 to Array.length depths - 1 do
+    let depth = Array.unsafe_get depths i in
+    if depth >= skip then mark m (uget slots (top - 1 - depth))
+  done
+
+let forward m word =
+  let off = I64.to_int word in
+  I64.of_int (Array.unsafe_get m.marks (off lsr 1) - 2)
+
+let forward_depths m slots top skip depths =
+  for i = 0 to Array.length depths - 1 do
+    let depth = Array.unsafe_get depths i in
+    if depth >= skip
+    then begin
+      let slot = top - 1 - depth in
+      uset slots slot (forward m (uget slots slot))
+    end
+  done
+
+let call_width code pc =
+  let w = I32.to_int (uget code pc) in
+  match w land 63 with
+  | 40 -> 2
+  | 42 -> ((w asr 6) land 7) + 2
+  | _ -> Value.error "collector: return address is not a call"
+
+let collect m p pc sp fsp fbase csp ap =
+  let objects = ap / 2 in
+  for i = 0 to objects - 1 do
+    Array.unsafe_set m.marks i 0
+  done;
+  m.mark_head <- 0;
+  m.mark_tail <- 0;
+  mark_depths m m.stack sp 0 (Array.unsafe_get p.stack_maps pc);
+  mark_depths m m.frame fsp 0 (Array.unsafe_get p.frame_maps pc);
+  for i = csp - 1 downto 0 do
+    let callpc = Array.unsafe_get m.retpc i - 1 in
+    let consumed = call_width p.code callpc in
+    mark_depths m m.stack (Array.unsafe_get m.retsp i + consumed) consumed
+      (Array.unsafe_get p.stack_maps callpc);
+    let top = if i = csp - 1 then fbase else Array.unsafe_get m.retfb (i + 1) in
+    mark_depths m m.frame top 0 (Array.unsafe_get p.frame_maps callpc)
+  done;
+  while m.mark_head < m.mark_tail do
+    let off = Array.unsafe_get m.work m.mark_head in
+    m.mark_head <- m.mark_head + 1;
+    let layout = Array.unsafe_get m.layouts (off lsr 1) in
+    if layout land 1 <> 0 then mark m (uget m.arena off);
+    if layout land 2 <> 0 then mark m (uget m.arena (off + 1))
+  done;
+  m.gc_new <- 0;
+  for obj = 0 to objects - 1 do
+    if Array.unsafe_get m.marks obj <> 0
+    then begin
+      Array.unsafe_set m.marks obj (m.gc_new + 2);
+      m.gc_new <- m.gc_new + 2
+    end
+  done;
+  forward_depths m m.stack sp 0 (Array.unsafe_get p.stack_maps pc);
+  forward_depths m m.frame fsp 0 (Array.unsafe_get p.frame_maps pc);
+  for i = csp - 1 downto 0 do
+    let callpc = Array.unsafe_get m.retpc i - 1 in
+    let consumed = call_width p.code callpc in
+    forward_depths m m.stack (Array.unsafe_get m.retsp i + consumed) consumed
+      (Array.unsafe_get p.stack_maps callpc);
+    let top = if i = csp - 1 then fbase else Array.unsafe_get m.retfb (i + 1) in
+    forward_depths m m.frame top 0 (Array.unsafe_get p.frame_maps callpc)
+  done;
+  for obj = 0 to objects - 1 do
+    let forwarding = Array.unsafe_get m.marks obj in
+    if forwarding <> 0
+    then begin
+      let src = obj * 2 in
+      let dst = forwarding - 2 in
+      let layout = Array.unsafe_get m.layouts obj in
+      let a = uget m.arena src in
+      let b = uget m.arena (src + 1) in
+      uset m.arena dst (if layout land 1 = 0 then a else forward m a);
+      uset m.arena (dst + 1) (if layout land 2 = 0 then b else forward m b);
+      Array.unsafe_set m.layouts (dst lsr 1) layout
+    end
+  done;
+  m.gc_new
 
 (* operand depth inside one frame is statically bounded by expression nesting, so the
    overflow check only has to run at a call, with room for the callee's own operands *)
@@ -76,6 +194,7 @@ let link (m : t) (p : loaded) : unit -> int64# =
   let arena = m.arena in
   let retpc = m.retpc in
   let retfb = m.retfb in
+  let retsp = m.retsp in
   let arena_len = m.arena_len in
   let call_len = m.call_len in
   let frame_len = m.frame_len in
@@ -220,9 +339,11 @@ let link (m : t) (p : loaded) : unit -> int64# =
         (I64.of_int64 (Int64.of_float (F.to_float (to_f (uget stack (sp - 1))))));
       loop (pc + 1) sp fsp fbase csp ap
     | 36 ->
+      let ap = if ap + 2 > arena_len then collect m p pc sp fsp fbase csp ap else ap in
       if ap + 2 > arena_len then Value.error "arena exhausted";
       uset arena ap (uget stack (sp - 2));
       uset arena (ap + 1) (uget stack (sp - 1));
+      Array.unsafe_set m.layouts (ap lsr 1) (Array.unsafe_get p.heap_layouts pc);
       uset stack (sp - 2) (I64.of_int ap);
       loop (pc + 1) (sp - 1) fsp fbase csp (ap + 2)
     | 37 ->
@@ -232,9 +353,11 @@ let link (m : t) (p : loaded) : unit -> int64# =
       uset stack (sp - 1) (uget arena (I64.to_int (uget stack (sp - 1)) + 1));
       loop (pc + 1) sp fsp fbase csp ap
     | 39 ->
+      let ap = if ap + 2 > arena_len then collect m p pc sp fsp fbase csp ap else ap in
       if ap + 2 > arena_len then Value.error "arena exhausted";
       uset arena ap (I64.of_int (w asr 6));
       uset arena (ap + 1) (uget stack (sp - 1));
+      Array.unsafe_set m.layouts (ap lsr 1) (Array.unsafe_get p.heap_layouts pc);
       uset stack (sp - 1) (I64.of_int ap);
       loop (pc + 1) sp fsp fbase csp (ap + 2)
     | 40 ->
@@ -243,6 +366,7 @@ let link (m : t) (p : loaded) : unit -> int64# =
       then Value.error "stack overflow";
       Array.unsafe_set retpc csp (pc + 1);
       Array.unsafe_set retfb csp fbase;
+      Array.unsafe_set retsp csp (sp - 2);
       uset frame fsp (uget arena (clos + 1));
       uset frame (fsp + 1) (uget stack (sp - 2));
       uset frame (fsp + 2) (uget stack (sp - 1));
@@ -265,6 +389,7 @@ let link (m : t) (p : loaded) : unit -> int64# =
       then Value.error "stack overflow";
       Array.unsafe_set retpc csp (pc + 1);
       Array.unsafe_set retfb csp fbase;
+      Array.unsafe_set retsp csp (sp - n - 1);
       uset frame fsp (uget stack (sp - 1 - n));
       for i = 0 to n - 1 do
         uset frame (fsp + 1 + i) (uget stack (sp - n + i))

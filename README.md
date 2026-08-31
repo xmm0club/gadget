@@ -144,11 +144,11 @@ Comparison operators do not chain, and `a < b < c` is a syntax error that says t
 
 ## Not done
 
-- The arena is still a bump allocator with no collector, so a program that allocates in a
+- ~~The arena is still a bump allocator with no collector, so a program that allocates in a
   loop runs out rather than collecting. Direct calls remove the closure per argument, which
   is what made a plain two argument loop allocate, but a loop that builds tuples still
   grows the arena until it is exhausted. Collecting needs stack maps, which the emitter has
-  the information to produce because it knows the static type at every call site
+  the information to produce because it knows the static type at every call site~~
 - Strings, chars and lists are missing. Lists need no tag, since the static type already
   says what a word is and nil can be the null pointer, but they do need the collector above
   to be worth having
