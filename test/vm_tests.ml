@@ -58,6 +58,21 @@ let () =
       let w = loop_alloc name in
       if w > 0.0 then fail "unboxed eval loop allocated %.0f words over 100 runs of %s" w name)
     [ "rec.gs"; "tailrec.gs"; "ackermann.gs"; "funtuple.gs" ];
+  let gc_src =
+    "let rec loop n keep =\n\
+     \  if n == 0 then keep else loop (n - 1) (n, snd keep)\n\
+     ((7, 8), loop 10000 (0, (40, 2)))\n"
+  in
+  let gc_machine = Vm.create ~stack:1024 ~frame:1024 ~arena:8 ~calls:16 () in
+  let gc_program = Vm.load (Driver.image (Driver.bytecode (Driver.front gc_src))) in
+  let gc_run = Vm.link gc_machine gc_program in
+  let before = Gc.minor_words () in
+  Vm.ignore_word (gc_run ());
+  let words = Gc.minor_words () -. before in
+  if words > 0.0 then fail "collector allocated %.0f host words" words;
+  let got = Value.show (Vm.run gc_machine gc_program) in
+  if got <> "((7, 8), 1, 40, 2)"
+  then fail "collector: expected ((7, 8), 1, 40, 2) but got %s" got;
   if !failures = 0
   then
     Printf.printf
